@@ -153,15 +153,15 @@ class AIAgent:
         # --- RESPONSE MESSAGES ---
         def get_reset_msg():
             msgs = [
-                "Tabula Rasa! I've wiped all constraints. We are starting fresh.",
+                " I've wiped all constraints. We are starting fresh.",
                 "Done. I've cleared every restriction for Teachers, Rooms, and Subjects.",
-                "Reset complete! The schedule is now a blank canvas.",
+                "Reset complete",
             ]
             return random.choice(msgs)
 
         def get_move_msg(name, slot):
             msgs = [
-                f"Aye aye! I've pinned **{name}** to start exactly at **{slot}**.",
+                f"I've pinned **{name}** to start exactly at **{slot}**.",
                 f"Moved! **{name}** is locked to start at **{slot}**.",
             ]
             return random.choice(msgs)
