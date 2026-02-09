@@ -1,23 +1,26 @@
 import os
-from typing import Annotated, List, Literal, Union, Dict, Any
+import random
+from typing import List, Literal, Union, Dict
+from dotenv import load_dotenv
+
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+from firebase_admin import firestore
+
 from database import db, fetch_all_data
-from firebase_admin import firestore # Import for DELETE_FIELD
-import random
-from dotenv import load_dotenv
+
 load_dotenv()
 
-# ---------------- CONFIG ----------------
+# ================= CONFIG =================
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY)
-MODEL_ID = "gemini-3-flash-preview" 
+MODEL_ID = "gemini-3-flash-preview"
 
-# --- SCHEMAS ---
+# ================= SCHEMAS =================
 
-# 1. BLOCKING (Negative Constraints)
+# --- BLOCKING ---
 class BlockTeacher(BaseModel):
     action: Literal["block_teacher"]
     teacher_id: str
@@ -33,12 +36,7 @@ class BlockSubject(BaseModel):
     subject_id: str
     slot_ids: List[str]
 
-# 2. UNBLOCKING (Removing Constraints)
-class UnblockSubject(BaseModel):
-    action: Literal["unblock_subject"]
-    subject_id: str
-    slot_ids: List[str]
-
+# --- UNBLOCKING ---
 class UnblockTeacher(BaseModel):
     action: Literal["unblock_teacher"]
     teacher_id: str
@@ -49,26 +47,34 @@ class UnblockRoom(BaseModel):
     room_id: str
     slot_ids: List[str]
 
-# 3. FORCING (Positive Move Constraints)
+class UnblockSubject(BaseModel):
+    action: Literal["unblock_subject"]
+    subject_id: str
+    slot_ids: List[str]
+
+# --- FORCE ---
 class ForceSubject(BaseModel):
     action: Literal["force_subject"]
     subject_id: str
-    target_slot_id: str = Field(description="The single specific start slot, e.g. 'Mon_1'")
+    target_slot_id: str = Field(
+        description="Single start slot like 'Mon_1'"
+    )
 
-# 4. RESET (The Nuclear Option)
+# --- RESET ---
 class ClearAllConstraints(BaseModel):
     action: Literal["clear_all_constraints"]
-    confirmation: bool = Field(description="Always true if user asks to reset everything.")
+    confirmation: bool = Field(
+        description="Must be true if user asks to reset"
+    )
 
+# --- FALLBACK ---
 class GeneralConstraint(BaseModel):
     action: Literal["general_constraint"]
     description: str
 
-
-
-
-AgentResponse = Annotated[
-    Union[
+# --- ROOT AGENT RESPONSE ---
+class AgentAction(BaseModel):
+    response: Union[
         BlockTeacher,
         BlockRoom,
         BlockSubject,
@@ -78,16 +84,13 @@ AgentResponse = Annotated[
         ForceSubject,
         ClearAllConstraints,
         GeneralConstraint,
-    ],
-    Field(discriminator="action"),
-]
+    ]
 
-class AgentAction(BaseModel):
-    response: AgentResponse
-
-# --- AGENT ---
+# ================= AGENT =================
 
 class AIAgent:
+
+    # ---------- CONTEXT ----------
     def get_context(self) -> Dict:
         data = fetch_all_data()
         return {
@@ -96,182 +99,194 @@ class AIAgent:
             "subjects": {s["id"]: s["name"] for s in data.get("subjects", [])},
         }
 
+    # ---------- MAIN ENTRY ----------
     def process_command(self, user_text: str) -> dict:
         ctx = self.get_context()
-        
+
         prompt = f"""
-        You are a School Scheduler Assistant.
-        
-        CONTEXT:
-        Subjects: {ctx['subjects']}
-        Teachers: {ctx['teachers']}
-        Rooms: {ctx['rooms']}
-        
-        INSTRUCTIONS:
-        1. **BLOCK**: "busy", "unavailable", "can't", "don't put" -> 'block_*'
-        2. **UNBLOCK**: "free", "available", "remove restriction" -> 'unblock_*'
-        3. **MOVE/FORCE**: "Move [Subject] to [Day] [Slot]", "Must start at..." -> 'force_subject'.
-        4. **RESET**: "Remove all constraints", "Clear everything", "Reset", "Start fresh" -> 'clear_all_constraints'.
-        
-        USER COMMAND: "{user_text}"
-        """
-        
+You are a School Scheduler Assistant.
+
+CONTEXT:
+Subjects: {ctx['subjects']}
+Teachers: {ctx['teachers']}
+Rooms: {ctx['rooms']}
+
+INSTRUCTIONS:
+1. BLOCK → block_*
+2. UNBLOCK → unblock_*
+3. FORCE → force_subject
+4. RESET → clear_all_constraints
+
+USER COMMAND:
+"{user_text}"
+"""
+
         try:
             response = client.models.generate_content(
                 model=MODEL_ID,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=AgentResponse
-                )
+                    response_schema=AgentAction,
+                ),
             )
-            parsed_action = response.parsed
-            return self.execute_action(parsed_action, ctx)
-            
+
+            # ================= CRITICAL FIX =================
+            parsed = response.parsed
+
+            # Gemini MAY return a dict in production → revalidate
+            if isinstance(parsed, dict):
+                parsed = AgentAction.model_validate(parsed)
+
+            action_obj = parsed.response
+            # =================================================
+
+            return self.execute_action(action_obj, ctx)
+
         except Exception as e:
-            return {"status": "error", "message": f"I got confused! Error: {str(e)}"}
+            return {
+                "status": "error",
+                "message": f"I got confused! Error: {str(e)}",
+            }
 
+    # ---------- SLOT EXPANDER ----------
     def expand_slots(self, slot_ids: List[str]) -> List[str]:
-        final_slots = []
+        final = []
         for s in slot_ids:
-            if len(s) == 3 and "_" not in s: # e.g. "Mon"
-                final_slots.extend([f"{s}_{i}" for i in range(1, 9)])
+            if len(s) == 3 and "_" not in s:
+                final.extend([f"{s}_{i}" for i in range(1, 9)])
             else:
-                final_slots.append(s)
-        return list(set(final_slots))
+                final.append(s)
+        return list(set(final))
 
+    # ---------- EXECUTION ----------
     def execute_action(self, action_obj, ctx: Dict):
-        
-        # --- HELPER: UPDATER ---
+
+        # ----- helpers -----
         def update_constraint(collection, doc_id, slots, mode="block"):
             ref = db.collection(collection).document(doc_id)
             doc = ref.get()
-            if not doc.exists: return None, f"I couldn't find ID {doc_id} in the database."
-            
+            if not doc.exists:
+                return False, f"ID {doc_id} not found."
+
             current = doc.to_dict().get("unavailable_slots", [])
             if mode == "block":
                 updated = list(set(current + slots))
             else:
                 updated = [s for s in current if s not in slots]
-                
-            ref.update({"unavailable_slots": updated})
-            return True, "Updated"
 
-        # --- HELPER: RESETTER ---
-        def wipe_collection_constraints(collection_name, fields_to_reset):
-            """
-            Iterates through a collection and clears specific fields.
-            """
+            ref.update({"unavailable_slots": updated})
+            return True, None
+
+        def wipe_collection(collection, fields):
             batch = db.batch()
             count = 0
-            docs = db.collection(collection_name).stream()
-            
-            for doc in docs:
-                batch.update(doc.reference, fields_to_reset)
+            for doc in db.collection(collection).stream():
+                batch.update(doc.reference, fields)
                 count += 1
-                if count >= 400: # Commit in chunks to avoid limits
+                if count >= 400:
                     batch.commit()
                     batch = db.batch()
                     count = 0
-            
-            if count > 0:
+            if count:
                 batch.commit()
 
-        # --- RESPONSE MESSAGES ---
-        def get_reset_msg():
-            msgs = [
-                "Tabula Rasa! I've wiped all constraints. We are starting fresh.",
-                "Done. I've cleared every restriction for Teachers, Rooms, and Subjects.",
-                "Reset complete! The schedule is now a blank canvas with no rules.",
-                "Boom! 💥 All constraints deleted. Let's try generating again.",
-            ]
-            return random.choice(msgs)
-
-        def get_move_msg(name, slot):
-            msgs = [
-                f"Aye aye! I've pinned **{name}** to start exactly at **{slot}**.",
-                f"Moved! **{name}** is locked to start at **{slot}**.",
-                f"You're the boss. **{name}** will happen at **{slot}**.",
-            ]
-            return random.choice(msgs)
-
-        # --- HANDLERS ---
-
-        # 1. CLEAR ALL (NUCLEAR OPTION)
+        # ----- RESET -----
         if isinstance(action_obj, ClearAllConstraints):
-            try:
-                # Reset Teachers
-                wipe_collection_constraints("teachers", {"unavailable_slots": []})
-                # Reset Rooms
-                wipe_collection_constraints("rooms", {"unavailable_slots": []})
-                # Reset Subjects (Clear blocks AND fixed slots)
-                wipe_collection_constraints("subjects", {
-                    "unavailable_slots": [], 
-                    "fixed_slot": firestore.DELETE_FIELD
-                })
-                return {"status": "success", "message": get_reset_msg()}
-            except Exception as e:
-                return {"status": "error", "message": f"Failed to reset: {str(e)}"}
+            wipe_collection("teachers", {"unavailable_slots": []})
+            wipe_collection("rooms", {"unavailable_slots": []})
+            wipe_collection(
+                "subjects",
+                {
+                    "unavailable_slots": [],
+                    "fixed_slot": firestore.DELETE_FIELD,
+                },
+            )
+            return {
+                "status": "success",
+                "message": "All constraints cleared. Fresh start ✨",
+            }
 
-        # 2. TEACHERS
+        # ----- TEACHERS -----
         if isinstance(action_obj, BlockTeacher):
             slots = self.expand_slots(action_obj.slot_ids)
-            ok, err = update_constraint("teachers", action_obj.teacher_id, slots, "block")
-            if not ok: return {"status": "error", "message": err}
-            name = ctx["teachers"].get(action_obj.teacher_id, "that teacher")
-            return {"status": "success", "message": f"Blocked **{name}** for {len(slots)} slots."}
+            ok, err = update_constraint(
+                "teachers", action_obj.teacher_id, slots, "block"
+            )
+            if not ok:
+                return {"status": "error", "message": err}
+            return {"status": "success", "message": "Teacher blocked."}
 
         if isinstance(action_obj, UnblockTeacher):
             slots = self.expand_slots(action_obj.slot_ids)
-            ok, err = update_constraint("teachers", action_obj.teacher_id, slots, "unblock")
-            if not ok: return {"status": "error", "message": err}
-            name = ctx["teachers"].get(action_obj.teacher_id, "that teacher")
-            return {"status": "success", "message": f"Freed up **{name}** on {len(slots)} slots."}
+            ok, err = update_constraint(
+                "teachers", action_obj.teacher_id, slots, "unblock"
+            )
+            if not ok:
+                return {"status": "error", "message": err}
+            return {"status": "success", "message": "Teacher unblocked."}
 
-        # 3. ROOMS
+        # ----- ROOMS -----
         if isinstance(action_obj, BlockRoom):
             slots = self.expand_slots(action_obj.slot_ids)
-            ok, err = update_constraint("rooms", action_obj.room_id, slots, "block")
-            if not ok: return {"status": "error", "message": err}
-            name = ctx["rooms"].get(action_obj.room_id, "that room")
-            return {"status": "success", "message": f"Closed **{name}** for {len(slots)} slots."}
+            ok, err = update_constraint(
+                "rooms", action_obj.room_id, slots, "block"
+            )
+            if not ok:
+                return {"status": "error", "message": err}
+            return {"status": "success", "message": "Room blocked."}
 
         if isinstance(action_obj, UnblockRoom):
             slots = self.expand_slots(action_obj.slot_ids)
-            ok, err = update_constraint("rooms", action_obj.room_id, slots, "unblock")
-            if not ok: return {"status": "error", "message": err}
-            name = ctx["rooms"].get(action_obj.room_id, "that room")
-            return {"status": "success", "message": f"Opened **{name}** again."}
+            ok, err = update_constraint(
+                "rooms", action_obj.room_id, slots, "unblock"
+            )
+            if not ok:
+                return {"status": "error", "message": err}
+            return {"status": "success", "message": "Room unblocked."}
 
-        # 4. SUBJECTS (BLOCK/UNBLOCK)
+        # ----- SUBJECTS -----
         if isinstance(action_obj, BlockSubject):
             slots = self.expand_slots(action_obj.slot_ids)
-            ok, err = update_constraint("subjects", action_obj.subject_id, slots, "block")
-            if not ok: return {"status": "error", "message": err}
-            name = ctx["subjects"].get(action_obj.subject_id, "that subject")
-            return {"status": "success", "message": f"Restricted **{name}** on {len(slots)} slots."}
-        
+            ok, err = update_constraint(
+                "subjects", action_obj.subject_id, slots, "block"
+            )
+            if not ok:
+                return {"status": "error", "message": err}
+            return {"status": "success", "message": "Subject restricted."}
+
         if isinstance(action_obj, UnblockSubject):
             slots = self.expand_slots(action_obj.slot_ids)
-            ok, err = update_constraint("subjects", action_obj.subject_id, slots, "unblock")
-            if not ok: return {"status": "error", "message": err}
-            name = ctx["subjects"].get(action_obj.subject_id, "that subject")
-            return {"status": "success", "message": f"Restrictions removed for **{name}**."}
+            ok, err = update_constraint(
+                "subjects", action_obj.subject_id, slots, "unblock"
+            )
+            if not ok:
+                return {"status": "error", "message": err}
+            return {"status": "success", "message": "Subject freed."}
 
-        # 5. FORCE / MOVE (SUBJECT)
+        # ----- FORCE -----
         if isinstance(action_obj, ForceSubject):
             ref = db.collection("subjects").document(action_obj.subject_id)
-            if ref.get().exists:
-                ref.update({
+            if not ref.get().exists:
+                return {"status": "error", "message": "Subject not found."}
+
+            ref.update(
+                {
                     "fixed_slot": action_obj.target_slot_id,
-                    "unavailable_slots": [] # Clear conflicts if forcing
-                })
-                s_name = ctx["subjects"].get(action_obj.subject_id, "Subject")
-                return {"status": "success", "message": get_move_msg(s_name, action_obj.target_slot_id)}
-            return {"status": "error", "message": "I couldn't find that subject!"}
+                    "unavailable_slots": [],
+                }
+            )
+            return {
+                "status": "success",
+                "message": f"Subject forced to {action_obj.target_slot_id}",
+            }
 
-        # --- DEFAULT ---
-        return {"status": "success", "message": "I've noted that constraint down."}
+        # ----- FALLBACK -----
+        return {
+            "status": "success",
+            "message": "Constraint noted.",
+        }
 
+    # ---------- SOLVER FAILURE ----------
     def analyze_solver_failure(self, data, error):
-        return "Solver failed. Try telling me to 'Clear all constraints' or 'Reset' to start over."
+        return "Solver failed. Try clearing constraints."
