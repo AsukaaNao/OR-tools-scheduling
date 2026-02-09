@@ -1,5 +1,5 @@
 import os
-from typing import List, Literal, Union, Dict, Any
+from typing import Annotated, List, Literal, Union, Dict, Any
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -64,12 +64,26 @@ class GeneralConstraint(BaseModel):
     action: Literal["general_constraint"]
     description: str
 
+
+
+
+AgentResponse = Annotated[
+    Union[
+        BlockTeacher,
+        BlockRoom,
+        BlockSubject,
+        UnblockTeacher,
+        UnblockRoom,
+        UnblockSubject,
+        ForceSubject,
+        ClearAllConstraints,
+        GeneralConstraint,
+    ],
+    Field(discriminator="action"),
+]
+
 class AgentAction(BaseModel):
-    response: Union[
-        BlockTeacher, BlockRoom, BlockSubject, 
-        UnblockTeacher, UnblockRoom, UnblockSubject, 
-        ForceSubject, ClearAllConstraints, GeneralConstraint
-    ]
+    response: AgentResponse
 
 # --- AGENT ---
 
