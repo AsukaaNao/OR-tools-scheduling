@@ -1,6 +1,6 @@
 import os
 import random
-from typing import List, Literal, Union, Dict, Any, Optional
+from typing import List, Literal, Dict, Any
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -18,10 +18,10 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY)
 MODEL_ID = "gemini-3-flash-preview" 
 
-# --- SCHEMAS (FULLY FLATTENED) ---
+# --- SCHEMAS (STRICT & FLAT) ---
 
-# We removed "AgentAction". This is now the ONLY schema.
-# It is completely flat (no nested classes) to prevent "$ref" errors.
+# FIX: Removed "Optional". Used strict types with default values ("" or [])
+# to prevent SDK validation errors regarding "NULL" types.
 class SchedulerAction(BaseModel):
     action: Literal[
         "block_teacher", 
@@ -35,14 +35,16 @@ class SchedulerAction(BaseModel):
         "general_constraint"
     ]
     
-    # All fields are optional and at the top level
-    teacher_id: Optional[str] = Field(None, description="ID of the teacher if relevant")
-    room_id: Optional[str] = Field(None, description="ID of the room if relevant")
-    subject_id: Optional[str] = Field(None, description="ID of the subject if relevant")
-    slot_ids: Optional[List[str]] = Field(None, description="List of slots to block/unblock")
-    target_slot_id: Optional[str] = Field(None, description="Target slot for force actions (e.g. 'Mon_1')")
-    confirmation: Optional[bool] = None
-    description: Optional[str] = None
+    # Defaults ensure the API never sees "null"
+    teacher_id: str = Field("", description="ID of the teacher if relevant, else empty string")
+    room_id: str = Field("", description="ID of the room if relevant, else empty string")
+    subject_id: str = Field("", description="ID of the subject if relevant, else empty string")
+    
+    slot_ids: List[str] = Field(default_factory=list, description="List of slots to block/unblock")
+    
+    target_slot_id: str = Field("", description="Target slot for force actions (e.g. 'Mon_1')")
+    confirmation: bool = Field(False, description="True if user wants to reset/clear all")
+    description: str = Field("", description="General description if needed")
 
 # --- AGENT ---
 
@@ -68,6 +70,7 @@ class AIAgent:
         
         INSTRUCTIONS:
         Determine the intent and extract the parameters into the JSON schema.
+        If a field is not relevant to the action, leave it as an empty string "" or empty list [].
         
         1. **BLOCK**: "busy", "unavailable", "can't", "don't put" -> 'block_*'
         2. **UNBLOCK**: "free", "available", "remove restriction" -> 'unblock_*'
@@ -114,6 +117,7 @@ class AIAgent:
         
         # --- HELPER: UPDATER ---
         def update_constraint(collection, doc_id, slots, mode="block"):
+            # Check for empty string instead of None
             if not doc_id: return None, "Missing ID."
             
             ref = db.collection(collection).document(doc_id)
