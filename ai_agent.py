@@ -125,7 +125,7 @@ class AIAgent:
                     response_schema=AgentResponse
                 )
             )
-            parsed_action = response.parsed.response
+            parsed_action = response.parsed
             return self.execute_action(parsed_action, ctx)
             
         except Exception as e:
