@@ -16,11 +16,12 @@ load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY)
-MODEL_ID = "gemini-2.0-flash"  # or "gemini-1.5-flash"
+MODEL_ID = "gemini-3-flash-preview" 
 
-# --- SCHEMAS (FIXED) ---
+# --- SCHEMAS (FULLY FLATTENED) ---
 
-# We use a single unified class to avoid "Union" ($ref) errors in the Google SDK
+# We removed "AgentAction". This is now the ONLY schema.
+# It is completely flat (no nested classes) to prevent "$ref" errors.
 class SchedulerAction(BaseModel):
     action: Literal[
         "block_teacher", 
@@ -34,28 +35,14 @@ class SchedulerAction(BaseModel):
         "general_constraint"
     ]
     
-    # Optional fields (The AI fills only what is relevant to the action)
+    # All fields are optional and at the top level
     teacher_id: Optional[str] = Field(None, description="ID of the teacher if relevant")
     room_id: Optional[str] = Field(None, description="ID of the room if relevant")
     subject_id: Optional[str] = Field(None, description="ID of the subject if relevant")
-    
-    # For blocking/unblocking multiple slots
     slot_ids: Optional[List[str]] = Field(None, description="List of slots to block/unblock")
-    
-    # Specific to force_subject
-    target_slot_id: Optional[str] = Field(
-        None, 
-        description="The single specific start slot, e.g. 'Mon_1'"
-    )
-    
-    # Specific to clear_all
+    target_slot_id: Optional[str] = Field(None, description="Target slot for force actions (e.g. 'Mon_1')")
     confirmation: Optional[bool] = None
-    
-    # Specific to general_constraint
     description: Optional[str] = None
-
-class AgentAction(BaseModel):
-    response: SchedulerAction
 
 # --- AGENT ---
 
@@ -80,28 +67,36 @@ class AIAgent:
         Rooms: {ctx['rooms']}
         
         INSTRUCTIONS:
+        Determine the intent and extract the parameters into the JSON schema.
+        
         1. **BLOCK**: "busy", "unavailable", "can't", "don't put" -> 'block_*'
         2. **UNBLOCK**: "free", "available", "remove restriction" -> 'unblock_*'
         3. **MOVE/FORCE**: "Move [Subject] to [Day] [Slot]", "Must start at..." -> 'force_subject'.
-        4. **RESET**: "Remove all constraints", "Clear everything", "Reset", "Start fresh" -> 'clear_all_constraints'.
+        4. **RESET**: "Remove all constraints", "Clear everything", "Reset" -> 'clear_all_constraints'.
         
         USER COMMAND: "{user_text}"
         """
         
         try:
+            # We pass the flat SchedulerAction directly as the schema
             response = client.models.generate_content(
                 model=MODEL_ID,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=AgentAction
+                    response_schema=SchedulerAction
                 )
             )
-            parsed_action = response.parsed.response
+            
+            # The SDK now returns the SchedulerAction instance directly
+            parsed_action = response.parsed 
+            
+            if not parsed_action:
+                 return {"status": "error", "message": "I couldn't understand that command."}
+
             return self.execute_action(parsed_action, ctx)
             
         except Exception as e:
-            # Print error to console for debugging in Railway logs
             print(f"Agent Error: {e}")
             return {"status": "error", "message": f"I got confused! Error: {str(e)}"}
 
@@ -136,9 +131,6 @@ class AIAgent:
 
         # --- HELPER: RESETTER ---
         def wipe_collection_constraints(collection_name, fields_to_reset):
-            """
-            Iterates through a collection and clears specific fields.
-            """
             batch = db.batch()
             count = 0
             docs = db.collection(collection_name).stream()
@@ -146,7 +138,7 @@ class AIAgent:
             for doc in docs:
                 batch.update(doc.reference, fields_to_reset)
                 count += 1
-                if count >= 400: # Commit in chunks to avoid limits
+                if count >= 400: 
                     batch.commit()
                     batch = db.batch()
                     count = 0
@@ -159,8 +151,7 @@ class AIAgent:
             msgs = [
                 "Tabula Rasa! I've wiped all constraints. We are starting fresh.",
                 "Done. I've cleared every restriction for Teachers, Rooms, and Subjects.",
-                "Reset complete! The schedule is now a blank canvas with no rules.",
-                "Boom! 💥 All constraints deleted. Let's try generating again.",
+                "Reset complete! The schedule is now a blank canvas.",
             ]
             return random.choice(msgs)
 
@@ -168,20 +159,15 @@ class AIAgent:
             msgs = [
                 f"Aye aye! I've pinned **{name}** to start exactly at **{slot}**.",
                 f"Moved! **{name}** is locked to start at **{slot}**.",
-                f"You're the boss. **{name}** will happen at **{slot}**.",
             ]
             return random.choice(msgs)
 
-        # --- HANDLERS (UPDATED FOR FLAT SCHEMA) ---
+        # --- HANDLERS ---
 
-        # 1. CLEAR ALL (NUCLEAR OPTION)
         if action_obj.action == "clear_all_constraints":
             try:
-                # Reset Teachers
                 wipe_collection_constraints("teachers", {"unavailable_slots": []})
-                # Reset Rooms
                 wipe_collection_constraints("rooms", {"unavailable_slots": []})
-                # Reset Subjects (Clear blocks AND fixed slots)
                 wipe_collection_constraints("subjects", {
                     "unavailable_slots": [], 
                     "fixed_slot": firestore.DELETE_FIELD
@@ -190,7 +176,6 @@ class AIAgent:
             except Exception as e:
                 return {"status": "error", "message": f"Failed to reset: {str(e)}"}
 
-        # 2. TEACHERS
         if action_obj.action == "block_teacher":
             slots = self.expand_slots(action_obj.slot_ids)
             ok, err = update_constraint("teachers", action_obj.teacher_id, slots, "block")
@@ -205,7 +190,6 @@ class AIAgent:
             name = ctx["teachers"].get(action_obj.teacher_id, "that teacher")
             return {"status": "success", "message": f"Freed up **{name}** on {len(slots)} slots."}
 
-        # 3. ROOMS
         if action_obj.action == "block_room":
             slots = self.expand_slots(action_obj.slot_ids)
             ok, err = update_constraint("rooms", action_obj.room_id, slots, "block")
@@ -220,7 +204,6 @@ class AIAgent:
             name = ctx["rooms"].get(action_obj.room_id, "that room")
             return {"status": "success", "message": f"Opened **{name}** again."}
 
-        # 4. SUBJECTS (BLOCK/UNBLOCK)
         if action_obj.action == "block_subject":
             slots = self.expand_slots(action_obj.slot_ids)
             ok, err = update_constraint("subjects", action_obj.subject_id, slots, "block")
@@ -235,20 +218,18 @@ class AIAgent:
             name = ctx["subjects"].get(action_obj.subject_id, "that subject")
             return {"status": "success", "message": f"Restrictions removed for **{name}**."}
 
-        # 5. FORCE / MOVE (SUBJECT)
         if action_obj.action == "force_subject":
             if not action_obj.subject_id: return {"status": "error", "message": "Missing subject ID"}
             ref = db.collection("subjects").document(action_obj.subject_id)
             if ref.get().exists:
                 ref.update({
                     "fixed_slot": action_obj.target_slot_id,
-                    "unavailable_slots": [] # Clear conflicts if forcing
+                    "unavailable_slots": [] 
                 })
                 s_name = ctx["subjects"].get(action_obj.subject_id, "Subject")
                 return {"status": "success", "message": get_move_msg(s_name, action_obj.target_slot_id)}
             return {"status": "error", "message": "I couldn't find that subject!"}
 
-        # --- DEFAULT ---
         return {"status": "success", "message": "I've noted that constraint down."}
 
     def analyze_solver_failure(self, data, error):
