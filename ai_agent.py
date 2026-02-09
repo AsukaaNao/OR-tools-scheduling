@@ -122,7 +122,7 @@ class AIAgent:
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=AgentAction
+                    response_schema=AgentResponse
                 )
             )
             parsed_action = response.parsed.response
