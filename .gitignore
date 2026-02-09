@@ -1,0 +1,54 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# =========================
+# Virtual Environments
+# =========================
+venv/
+.env/
+.env.*
+.venv/
+
+# =========================
+# Environment / Secrets
+# =========================
+.env
+firebase_credentials.json
+serviceAccountKey.json
+*.pem
+*.key
+
+# =========================
+# Firebase
+# =========================
+.firebase/
+.firestore/
+.firebaserc
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# OS / Editor junk
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Railway
+# =========================
+railway.toml
